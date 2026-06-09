@@ -8,6 +8,8 @@ from odoo.exceptions import UserError
 from odoo.fields import Command
 from odoo.orm.identifiers import NewId
 
+from .auditlog_guard import add_guard, has_conflict, remove_guard
+
 FIELDS_BLACKLIST = [
     "id",
     "create_uid",
@@ -365,7 +367,7 @@ class AuditlogRule(models.Model):
 
         @api.model_create_multi
         def create_full(self, vals_list, **kwargs):
-            self = self.with_context(auditlog_disabled=True)
+            self = self.with_context(auditlog_disabled_read=True)
             rule_model = self.env["auditlog.rule"]
             new_records = create_full.origin(self, vals_list, **kwargs)
             # Take a snapshot of record values from the cache instead of using
@@ -400,7 +402,7 @@ class AuditlogRule(models.Model):
 
         @api.model_create_multi
         def create_fast(self, vals_list, **kwargs):
-            self = self.with_context(auditlog_disabled=True)
+            self = self.with_context(auditlog_disabled_read=True)
             rule_model = self.env["auditlog.rule"]
             vals_list = rule_model._update_vals_list(vals_list)
             vals_list2 = copy.deepcopy(vals_list)
@@ -443,9 +445,9 @@ class AuditlogRule(models.Model):
             # avoid logs on `read` produced by auditlog during internal
             # processing: read data of relevant records, 'ir.model',
             # 'ir.model.fields'... (no interest in logging such operations)
-            if self.env.context.get("auditlog_disabled"):
+            if self.env.context.get("auditlog_disabled_read"):
                 return result
-            self = self.with_context(auditlog_disabled=True)
+            self = self.with_context(auditlog_disabled_read=True)
             rule_model = self.env["auditlog.rule"]
             if self.env.user in users_to_exclude:
                 return result
@@ -469,41 +471,56 @@ class AuditlogRule(models.Model):
         users_to_exclude = self.mapped("users_to_exclude_ids")
 
         def write_full(self, vals, **kwargs):
-            self = self.with_context(auditlog_disabled=True)
-            rule_model = self.env["auditlog.rule"]
-            fields_list = rule_model.get_auditlog_fields(self)
-            records_write = (
-                self.filtered(lambda r: not isinstance(r.id, NewId))
-                .sudo()
-                .with_context(prefetch_fields=False)
-            )
-            if not records_write:
+            self = self.with_context(auditlog_disabled_read=True)
+            guard_keys = {(self._name, tuple(self.ids))}
+
+            if has_conflict(guard_keys):
                 return write_full.origin(self, vals, **kwargs)
 
-            with ThrowAwayCache(self.env):
-                old_values = {d["id"]: d for d in records_write.read(fields_list)}
+            add_guard(guard_keys)
+            try:
+                rule_model = self.env["auditlog.rule"]
+                fields_list = rule_model.get_auditlog_fields(self)
 
-            result = write_full.origin(self, vals, **kwargs)
-            self.flush_recordset()
-            if self.env.user in users_to_exclude:
+                records_write = (
+                    self.filtered(lambda r: not isinstance(r.id, NewId))
+                    .sudo()
+                    .with_context(prefetch_fields=False)
+                )
+
+                if not records_write:
+                    return write_full.origin(self, vals, **kwargs)
+
+                with ThrowAwayCache(self.env):
+                    old_values = {d["id"]: d for d in records_write.read(fields_list)}
+
+                result = write_full.origin(self, vals, **kwargs)
+
+                self.flush_recordset()
+
+                if self.env.user not in users_to_exclude:
+                    with ThrowAwayCache(self.env):
+                        new_values = {
+                            d["id"]: d for d in records_write.read(fields_list)
+                        }
+
+                    rule_model.sudo().create_logs(
+                        self.env.uid,
+                        self._name,
+                        records_write.ids,
+                        "write",
+                        old_values,
+                        new_values,
+                        {"log_type": log_type},
+                    )
+
                 return result
 
-            with ThrowAwayCache(self.env):
-                new_values = {d["id"]: d for d in records_write.read(fields_list)}
-
-            rule_model.sudo().create_logs(
-                self.env.uid,
-                self._name,
-                records_write.ids,
-                "write",
-                old_values,
-                new_values,
-                {"log_type": log_type},
-            )
-            return result
+            finally:
+                remove_guard(guard_keys)
 
         def write_fast(self, vals, **kwargs):
-            self = self.with_context(auditlog_disabled=True)
+            self = self.with_context(auditlog_disabled_read=True)
             rule_model = self.env["auditlog.rule"]
             # Log the user input only, no matter if the `vals` is updated
             # afterwards as it could not represent the real state
@@ -535,7 +552,7 @@ class AuditlogRule(models.Model):
         users_to_exclude = self.mapped("users_to_exclude_ids")
 
         def unlink_full(self, **kwargs):
-            self = self.with_context(auditlog_disabled=True)
+            self = self.with_context(auditlog_disabled_read=True)
             rule_model = self.env["auditlog.rule"]
             fields_list = rule_model.get_auditlog_fields(self)
             old_values = {
@@ -558,7 +575,7 @@ class AuditlogRule(models.Model):
             return unlink_full.origin(self, **kwargs)
 
         def unlink_fast(self, **kwargs):
-            self = self.with_context(auditlog_disabled=True)
+            self = self.with_context(auditlog_disabled_read=True)
             rule_model = self.env["auditlog.rule"]
             if self.env.user in users_to_exclude:
                 return unlink_fast.origin(self, **kwargs)
@@ -583,7 +600,7 @@ class AuditlogRule(models.Model):
 
         def export_data(self, fields_to_export):
             res = export_data.origin(self, fields_to_export)
-            self = self.with_context(auditlog_disabled=True)
+            self = self.with_context(auditlog_disabled_read=True)
             rule_model = self.env["auditlog.rule"]
             if self.env.user in users_to_exclude:
                 return res
