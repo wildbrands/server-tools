@@ -82,6 +82,15 @@ class ThrowAwayCache:
         to the cursor, so if we want to keep using the same cursor, we need to
         patch out these properties.
         """
+        # Flush pending writes to the DB BEFORE swapping/clearing the transaction
+        # cache. Otherwise a flush triggered from inside the block (e.g. reading a
+        # relational field during the audit read-back) runs against the emptied
+        # cache and fails with "Could not find all values of <model> to flush
+        # them". This broke programmatic mass-creates (imports, XML-RPC, API) on
+        # audited models; the UI path just happened to be already flushed here.
+        for env in self._transaction.envs:
+            env.flush_all()
+            break
         for attribute in self.transaction_attributes:
             instance = getattr(self._transaction, attribute)
             setattr(
