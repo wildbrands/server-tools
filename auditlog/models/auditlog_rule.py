@@ -90,6 +90,7 @@ class ThrowAwayCache:
         # audited models; the UI path just happened to be already flushed here.
         for env in self._transaction.envs:
             env.flush_all()
+            break
         for attribute in self.transaction_attributes:
             instance = getattr(self._transaction, attribute)
             setattr(
